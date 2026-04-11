@@ -78,6 +78,9 @@ namespace fs = std::filesystem;
 #define GL_BACK 0x0405
 #endif
 
+// Native pixel format for glReadPixels: BGRA matches the BMP/FFmpeg rawvideo pipeline
+#define CAPTURE_FORMAT GL_BGRA
+
 typedef ptrdiff_t GLsizeiptr_t;
 
 typedef void      (APIENTRY* PFN_glGenBuffers)(GLsizei, GLuint*);
@@ -196,6 +199,15 @@ static std::string pickEncoder(int setting) {
         default: return autoDetectEncoder();
     }
 }
+
+// ==================================================================
+// Global encoder cache — forward-declared here so buildEncoderArgs can use it.
+// Populated by prewarmEncoderCache() on a background thread at mod load.
+// ==================================================================
+
+static std::mutex g_encoderCacheMtx;
+static std::unordered_map<std::string, bool> g_encoderCache;
+static std::atomic<bool> g_encoderCacheReady{false};
 
 static std::string buildEncoderArgs(const std::string& encoder, int crf,
                                     bool lowLatency = false) {
@@ -334,11 +346,8 @@ static bool testEncoderWorks(const std::string& ffmpegExe,
 // ==================================================================
 // Global encoder cache — pre-warmed at mod load on a background thread
 // so that F5 never blocks the GL thread for encoder probing.
+// (Variables declared above buildEncoderArgs to satisfy forward use.)
 // ==================================================================
-
-static std::mutex g_encoderCacheMtx;
-static std::unordered_map<std::string, bool> g_encoderCache;
-static std::atomic<bool> g_encoderCacheReady{false};
 
 static void prewarmEncoderCache(std::string ffmpegExe, std::string logDir) {
     log::info("[Rec] === Background encoder pre-test starting ===");
