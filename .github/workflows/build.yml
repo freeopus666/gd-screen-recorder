@@ -1,16 +1,21 @@
 name: Build Geode Mod
 
 on:
+  pull_request:
   push:
     tags:
       - 'v*'
-  pull_request:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Build mod
         id: build
@@ -18,78 +23,19 @@ jobs:
         with:
           target: Win64
 
-      - name: Upload artifact (PR builds)
+      - name: Upload artifact
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: geode-mod
-          path: 'build/*.geode'
+          path: ${{ steps.build.outputs.build-output }}
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          name: "GD Screen Recorder ${{ github.ref_name }}"
-          body: |
-            ## 🎬 GD Screen Recorder ${{ github.ref_name }}
-
-            A **Geode mod** for Geometry Dash that records gameplay directly inside the game — no OBS, no window capture.
-
-            ---
-
-            ### ✅ What's new in this release
-            - Stable 60 FPS recording on low-end GPUs (GT 630M, GT 710, etc.)
-            - Auto-fallback to CPU encoding (libx264) when GPU is unavailable
-            - Zero-stall frame capture via async PBO readback
-            - Dual audio tracks: microphone (Track 1) + game audio via WASAPI loopback (Track 2)
-            - Encoder test result caching — no freeze on first F5
-            - Auto-scale to 720p for CPU encoding to maintain 60 FPS
-
-            ---
-
-            ### 📋 Requirements
-            - **Geometry Dash 2.2081** (Steam or standalone)
-            - **[Geode mod loader](https://geode-sdk.org)** installed
-            - **ffmpeg.exe** placed in your Geometry Dash folder
-              → Download from: https://www.gyan.dev/ffmpeg/builds/ *(ffmpeg-release-essentials.zip → bin/ffmpeg.exe)*
-
-            ---
-
-            ### 🎮 Hotkeys
-            | Key | Action |
-            |-----|--------|
-            | **F5** | Start / Stop recording |
-            | **F8** | Cycle microphone device |
-            | **F9** | Cycle game audio device |
-            | **F11** | Toggle REC indicator |
-            | **F12** | Screenshot |
-
-            ---
-
-            ### ⚙️ Settings (in Geode menu)
-            | Setting | Description |
-            |---------|-------------|
-            | Video Quality | 1=Low · 2=Medium · 3=High · 4=Ultra |
-            | Recording FPS | 15–120 fps (default 60) |
-            | Video Encoder | Auto / NVIDIA / AMD / Intel / CPU |
-            | Output Folder | Where to save videos |
-            | Show Indicator | Blinking REC dot on screen |
-            | Record Microphone | Track 1 — mic audio |
-            | Record Game Audio | Track 2 — WASAPI loopback |
-
-            ---
-
-            ### 📦 Installation
-            1. Install [Geode mod loader](https://geode-sdk.org)
-            2. Download `freeopus666.screenrecorder.geode` below
-            3. Place it in `<GD folder>/geode/mods/`
-            4. Place `ffmpeg.exe` in `<GD folder>/`
-            5. Launch Geometry Dash
-
-            ---
-
-            > **Author:** [FreeOpus666](https://github.com/FreeOpus666)
-            > **Geode SDK:** 5.5.3 | **GD:** 2.2081
-          files: 'build/*.geode'
-          draft: false
-          prerelease: false
+          name: GD Screen Recorder ${{ github.ref_name }}
+          files: ${{ steps.build.outputs.build-output }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
