@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Build mod
         id: build
@@ -23,18 +23,12 @@ jobs:
         with:
           target: Win64
 
-      - name: Debug build output
-        shell: pwsh
-        run: |
-          Write-Host "build-output = ${{ steps.build.outputs.build-output }}"
-          Get-ChildItem -Path . -Recurse -Filter *.geode | Select-Object FullName
-
       - name: Upload artifact
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: geode-mod
-          path: ${{ steps.build.outputs.build-output }}
+          path: ${{ steps.build.outputs.build-output }}/*.geode
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -47,17 +41,30 @@ jobs:
 
             Official release of GD Screen Recorder for Geode.
 
+            ### Features
+            - In-game gameplay recording for Geometry Dash
+            - Hardware-accelerated encoding when available
+            - Automatic CPU fallback if GPU encoding is unavailable
+            - Separate microphone and game audio tracks
+            - Screenshot support and recording indicator
+
             ### Installation
             1. Install Geode.
-            2. Download the attached `.geode` file from this release.
-            3. Move the file to your `geode/mods` folder.
-            4. Launch the game.
+            2. Download the `.geode` file attached to this release.
+            3. Move it to your `geode/mods` folder.
+            4. Place `ffmpeg.exe` in your Geometry Dash folder.
+            5. Launch the game.
 
-            ### Notes
-            - This release was built automatically from the tagged commit.
-            - See the repository README for setup and usage details.
+            ### Hotkeys
+            - `F5` — Start / Stop recording
+            - `F8` — Cycle microphone device
+            - `F9` — Cycle game audio device
+            - `F11` — Toggle recording indicator
+            - `F12` — Take screenshot
           generate_release_notes: true
           files: |
-            ${{ steps.build.outputs.build-output }}
+            ${{ steps.build.outputs.build-output }}/*.geode
           fail_on_unmatched_files: true
           overwrite_files: true
+          draft: false
+          prerelease: false
