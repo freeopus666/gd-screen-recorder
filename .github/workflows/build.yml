@@ -1,0 +1,20 @@
+ name: Build Geode Mod
+
+ on:
+   push:
+     tags:
+       - 'v*'
+
+ jobs:
+   build:
+     runs-on: windows-latest
+     steps:
+       - uses: actions/checkout@v4
+       - name: Build mod
+         uses: geode-sdk/build-geode-mod@main
+         with:
+           target: win
+       - name: Upload release
+         uses: softprops/action-gh-release@v1
+         with:
+           files: '*.geode'
