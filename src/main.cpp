@@ -1189,19 +1189,25 @@ protected:
         int micInputIdx = -1;
         int gameInputIdx = -1;
 
-        // Microphone input via dshow
+        // Microphone input via dshow.
+        // -audio_buffer_size 30: cuts dshow's default ~500ms buffer to 30ms → eliminates mic delay.
         if (micEnabled && !micDevice.empty()) {
-            cmd << " -f dshow -thread_queue_size 2048 -i audio=\"" << micDevice << "\"";
+            cmd << " -f dshow -audio_buffer_size 30 -thread_queue_size 512 -i audio=\"" << micDevice << "\"";
             micInputIdx = inputIdx++;
         }
 
-        // Game audio: WASAPI loopback (modern FFmpeg) or dshow/StereoMix (older FFmpeg)
-        if (gameAudioEnabled && !gameAudioDevice.empty()) {
-            if (g_wasapiLoopbackSupported)
-                cmd << " -f wasapi -loopback 1 -thread_queue_size 2048 -i \"" << gameAudioDevice << "\"";
-            else
-                cmd << " -f dshow -thread_queue_size 2048 -i audio=\"" << gameAudioDevice << "\"";
-            gameInputIdx = inputIdx++;
+        // Game audio: WASAPI loopback (modern FFmpeg) or dshow/StereoMix (older FFmpeg).
+        // WASAPI: empty device string = FFmpeg selects the default playback device, which is
+        // always reliable.  Passing a resolved friendly name can fail when the WASAPI device
+        // list doesn't match the COM friendly name character-for-character.
+        if (gameAudioEnabled) {
+            if (g_wasapiLoopbackSupported) {
+                cmd << " -f wasapi -loopback 1 -thread_queue_size 512 -i \"" << gameAudioDevice << "\"";
+                gameInputIdx = inputIdx++;
+            } else if (!gameAudioDevice.empty()) {
+                cmd << " -f dshow -audio_buffer_size 30 -thread_queue_size 512 -i audio=\"" << gameAudioDevice << "\"";
+                gameInputIdx = inputIdx++;
+            }
         }
 
         // Map streams: video from pipe, audio tracks from dshow
@@ -1509,10 +1515,18 @@ public:
         std::string gameAudioDev;
         if (m_gameAudioEnabled) {
             if (g_wasapiLoopbackSupported) {
-                // Render device (speakers/headphones) → WASAPI loopback
-                gameAudioDev = resolveDeviceName(m_gameAudioDevice, false);
-                log::info("[Rec] WASAPI loopback device resolved: \"{}\" (from setting: \"{}\")",
-                          gameAudioDev, m_gameAudioDevice);
+                if (m_gameAudioDevice.empty()) {
+                    // Empty → pass "" to FFmpeg; WASAPI will use the default playback device.
+                    // DO NOT resolve to a friendly name: WASAPI device enumeration may not
+                    // match the COM API friendly name exactly, causing FFmpeg to fail silently.
+                    gameAudioDev = "";
+                    log::info("[Rec] WASAPI loopback: using default playback device");
+                } else {
+                    // User picked a specific device by index or name — resolve and pass it.
+                    gameAudioDev = resolveDeviceName(m_gameAudioDevice, false);
+                    log::info("[Rec] WASAPI loopback device resolved: \"{}\" (from setting: \"{}\")",
+                              gameAudioDev, m_gameAudioDevice);
+                }
             } else {
                 // Capture device (Stereo Mix) → dshow fallback
                 if (m_gameAudioDevice.empty()) {
@@ -1596,8 +1610,9 @@ public:
         // ── Early exit detection ──
         // If FFmpeg fails to open an audio device, it exits within ~200ms.
         // Detect this and gracefully retry without audio instead of a broken recording.
+        // WASAPI loopback with empty device means "use default" — still counts as audio.
         bool hasAnyAudio = (m_micEnabled && !micDev.empty()) ||
-                           (m_gameAudioEnabled && !gameAudioDev.empty());
+                           (m_gameAudioEnabled && (g_wasapiLoopbackSupported || !gameAudioDev.empty()));
         if (hasAnyAudio) {
             Sleep(400);
             if (!checkFFmpegAlive()) {
