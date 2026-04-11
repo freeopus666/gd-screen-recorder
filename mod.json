@@ -1,0 +1,73 @@
+{
+    "geode": "5.5.3",
+    "gd": {
+        "win": "2.2081"
+    },
+    "id": "gdrecorder.screenrecorder",
+    "name": "GD Screen Recorder",
+    "version": "7.0.0",
+    "developer": "JamStickGD",
+    "description": "Screen recorder with synced dual audio (Mic + Game Audio). F5 = record/stop, F8/F9 = select mic/audio device, F11 = indicator.",
+    "settings": {
+        "quality": {
+            "name": "Video Quality",
+            "description": "1 = Low (small file). 2 = Medium. 3 = High. 4 = Ultra (large file)",
+            "type": "int",
+            "default": 2,
+            "min": 1,
+            "max": 4
+        },
+        "fps": {
+            "name": "Recording FPS",
+            "description": "Frames per second. 60 = smooth, 30 = less space",
+            "type": "int",
+            "default": 60,
+            "min": 15,
+            "max": 120
+        },
+        "encoder": {
+            "name": "Video Encoder",
+            "description": "1 = Auto. 2 = NVIDIA. 3 = AMD. 4 = Intel. 5 = CPU",
+            "type": "int",
+            "default": 1,
+            "min": 1,
+            "max": 5
+        },
+        "output-dir": {
+            "name": "Output Folder",
+            "description": "Where to save videos. Empty = GD/recordings folder",
+            "type": "string",
+            "default": ""
+        },
+        "show-indicator": {
+            "name": "Show Indicator",
+            "description": "Blinking REC indicator on screen. Toggle with F11",
+            "type": "bool",
+            "default": true
+        },
+        "mic-enabled": {
+            "name": "Record Microphone (Track 1)",
+            "description": "Record microphone as audio Track 1. Press F8 in-game to select mic device from a popup list.",
+            "type": "bool",
+            "default": false
+        },
+        "mic-device": {
+            "name": "Microphone Device",
+            "description": "Device number (\"1\", \"2\") or exact name. Press F8 in-game to pick from active devices. Empty = default mic.",
+            "type": "string",
+            "default": ""
+        },
+        "game-audio-enabled": {
+            "name": "Record Game Audio (Track 2)",
+            "description": "Record game audio as Track 2 via WASAPI loopback. Press F9 in-game to select output device.",
+            "type": "bool",
+            "default": false
+        },
+        "game-audio-device": {
+            "name": "Game Audio Device",
+            "description": "Output device number or name. Press F9 in-game to pick from active devices. Empty = default output.",
+            "type": "string",
+            "default": ""
+        }
+    }
+}
