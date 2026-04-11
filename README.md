@@ -67,21 +67,6 @@ FFmpeg errors are logged to `recordings\~ffmpeg_log.txt` (deleted on success).
 
 ---
 
-## Building from source
-
-**Requirements:** CMake 3.21+, Visual Studio 2022 (C++ workload), [Geode SDK](https://docs.geode-sdk.org/getting-started/)
-
-```bash
-git clone https://github.com/JamStickGD/gd-screen-recorder
-cd gd-screen-recorder
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config RelWithDebInfo
-```
-
-Or just run `BUILD_GD_RECORDER.bat` from the Geometry Dash folder — it does everything automatically.
-
----
-
 ## License
 
 MIT — see [LICENSE](LICENSE)  
