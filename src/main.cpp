@@ -1,5 +1,5 @@
 /*
- * GD Screen Recorder v7.0.0 — Final Stable Edition
+ * GD Screen Recorder v1.0 — Stable Edition
  * Developer: JamStickGD
  *
  * Features:
@@ -218,12 +218,25 @@ static std::string buildEncoderArgs(const std::string& encoder, int crf,
                std::to_string(crf) + " -pix_fmt yuv420p";
     }
     if (encoder == "h264_qsv") {
-        if (lowLatency) {
-            return " -c:v h264_qsv -preset veryfast -low_power 1 -global_quality " +
-                   std::to_string(crf) + " -pix_fmt yuv420p";
+        // Check if VDBOX (fixed-function HW encoder) is available — 2-3x faster
+        bool useLowPower = false;
+        {
+            std::lock_guard<std::mutex> lk(g_encoderCacheMtx);
+            auto it = g_encoderCache.find("h264_qsv_lp");
+            if (it != g_encoderCache.end()) useLowPower = it->second;
         }
-        return " -c:v h264_qsv -preset veryfast -global_quality " +
-               std::to_string(crf) + " -pix_fmt yuv420p";
+
+        std::string args = " -c:v h264_qsv -preset veryfast";
+        if (useLowPower) args += " -low_power 1";
+        // -bf 0: disable B-frames (lower latency, faster encode, no reordering delay)
+        // -refs 1: single reference frame (less memory, faster motion search)
+        // -look_ahead 0: disable lookahead (instant frame-by-frame encode)
+        // -async_depth 4: 4-frame pipeline depth (better GPU utilization)
+        args += " -look_ahead 0 -bf 0 -refs 1 -async_depth 4";
+        args += " -global_quality " + std::to_string(crf) + " -pix_fmt nv12";
+        log::info("[Rec] QSV args: low_power={} preset=veryfast bf=0 refs=1 async=4",
+                  useLowPower ? "ON (VDBOX)" : "OFF (ring)");
+        return args;
     }
     // -threads 0 = use all available CPU cores.
     // Previously limited to 2, which capped encode throughput and caused
@@ -267,7 +280,8 @@ static BOOL spawnProcessW(const std::string& cmdUtf8,
 
 static bool testEncoderWorks(const std::string& ffmpegExe,
                               const std::string& encoder,
-                              const std::string& logDir) {
+                              const std::string& logDir,
+                              const std::string& extraArgs = "") {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     std::string logPath = logDir + "\\~ffmpeg_log.txt";
     HANDLE stderrLog = CreateFileA(
@@ -290,7 +304,7 @@ static bool testEncoderWorks(const std::string& ffmpegExe,
     std::string cmd = "\"" + ffmpegExe + "\""
         " -hide_banner -loglevel warning"
         " -f lavfi -i color=c=black:s=64x64:d=0.04:r=25"
-        " -frames:v 1 -c:v " + encoder +
+        " -frames:v 1 -c:v " + encoder + extraArgs +
         " -pix_fmt yuv420p -f null -";
 
     HANDLE stderrH = (stderrLog != INVALID_HANDLE_VALUE) ? stderrLog : nul;
@@ -317,6 +331,56 @@ static bool testEncoderWorks(const std::string& ffmpegExe,
     return exitCode == 0;
 }
 
+// ==================================================================
+// Global encoder cache — pre-warmed at mod load on a background thread
+// so that F5 never blocks the GL thread for encoder probing.
+// ==================================================================
+
+static std::mutex g_encoderCacheMtx;
+static std::unordered_map<std::string, bool> g_encoderCache;
+static std::atomic<bool> g_encoderCacheReady{false};
+
+static void prewarmEncoderCache(std::string ffmpegExe, std::string logDir) {
+    log::info("[Rec] === Background encoder pre-test starting ===");
+    auto t0 = std::chrono::steady_clock::now();
+    for (const char* enc : {"h264_nvenc", "h264_amf", "h264_qsv", "libx264"}) {
+        auto t1 = std::chrono::steady_clock::now();
+        bool works = testEncoderWorks(ffmpegExe, enc, logDir);
+        double dt = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t1).count();
+        {
+            std::lock_guard<std::mutex> lk(g_encoderCacheMtx);
+            g_encoderCache[enc] = works;
+        }
+        log::info("[Rec]   [{}] {} ({:.1f}s)", enc, works ? "OK" : "FAIL", dt);
+    }
+
+    // QSV low_power (VDBOX fixed-function) — 2-3x faster than ring/EU encode
+    // Only available on Intel Skylake+ (6th gen). Test separately so we can
+    // fall back to QSV without low_power on older Intel GPUs.
+    bool qsvWorks = false;
+    {
+        std::lock_guard<std::mutex> lk(g_encoderCacheMtx);
+        auto it = g_encoderCache.find("h264_qsv");
+        if (it != g_encoderCache.end()) qsvWorks = it->second;
+    }
+    if (qsvWorks) {
+        auto t1 = std::chrono::steady_clock::now();
+        bool lpWorks = testEncoderWorks(ffmpegExe, "h264_qsv", logDir, " -low_power 1");
+        double dt = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t1).count();
+        {
+            std::lock_guard<std::mutex> lk(g_encoderCacheMtx);
+            g_encoderCache["h264_qsv_lp"] = lpWorks;
+        }
+        log::info("[Rec]   [h264_qsv low_power] {} ({:.1f}s)", lpWorks ? "OK" : "FAIL", dt);
+    }
+    double total = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    g_encoderCacheReady.store(true, std::memory_order_release);
+    log::info("[Rec] === Encoder pre-test done in {:.1f}s (cache ready) ===", total);
+}
+
 // Test if this FFmpeg build recognizes the WASAPI -loopback option.
 // Returns true if supported (even if the probe device isn't found).
 static bool testWasapiLoopback(const std::string& ffmpegExe) {
@@ -333,7 +397,8 @@ static bool testWasapiLoopback(const std::string& ffmpegExe) {
 
     // Use a bogus device — we only care whether FFmpeg recognises the -loopback option.
     // "Unrecognized option 'loopback'" = old build, no WASAPI loopback.
-    // Any other error (device not found, etc.) = option IS present.
+    // "Unknown input format 'wasapi'" = WASAPI not compiled in at all.
+    // Any other error (device not found, etc.) = option IS present → WASAPI works.
     std::string cmd = "\"" + ffmpegExe +
         "\" -f wasapi -loopback 1 -i \"__wasapi_probe__\" -t 0 -f null -";
 
@@ -351,16 +416,29 @@ static bool testWasapiLoopback(const std::string& ffmpegExe) {
         output.append(buf, br);
     CloseHandle(pipe_r);
 
-    WaitForSingleObject(pi.hProcess, 3000);
+    WaitForSingleObject(pi.hProcess, 5000);
     CloseHandle(pi.hProcess);
 
-    bool supported = output.find("Unrecognized option") == std::string::npos;
-    if (supported)
-        log::info("[Rec] WASAPI loopback: SUPPORTED — game audio captures speakers directly.");
-    else
-        log::warn("[Rec] WASAPI loopback: NOT supported by this FFmpeg build. "
+    log::info("[Rec] WASAPI probe output ({}B): {}", output.size(),
+              output.size() > 300 ? output.substr(0, 300) + "..." : output);
+
+    bool notRecognized = output.find("Unrecognized option") != std::string::npos ||
+                         output.find("Unknown option") != std::string::npos;
+    bool noWasapi = output.find("Unknown input format") != std::string::npos;
+
+    if (noWasapi) {
+        log::error("[Rec] WASAPI loopback: NOT AVAILABLE — your FFmpeg build has no WASAPI support!");
+        log::error("[Rec] Download full FFmpeg from: https://www.gyan.dev/ffmpeg/builds/");
+        return false;
+    }
+    if (notRecognized) {
+        log::warn("[Rec] WASAPI loopback: NOT supported by this FFmpeg build (old version). "
                   "Falling back to dshow/Stereo Mix. Update FFmpeg for full support.");
-    return supported;
+        return false;
+    }
+
+    log::info("[Rec] WASAPI loopback: SUPPORTED — game audio captures speakers directly.");
+    return true;
 }
 
 // ==================================================================
@@ -512,7 +590,10 @@ static void logAudioDevices() {
     if (g_renderDevices.empty()) log::info("[Rec]   (none found)");
 
     std::string defMic = getDefaultAudioDeviceName(true);
+    std::string defSpk = getDefaultAudioDeviceName(false);
     if (!defMic.empty()) log::info("[Rec] Default mic (auto): \"{}\"", defMic);
+    if (!defSpk.empty()) log::info("[Rec] Default speaker (auto): \"{}\"", defSpk);
+    if (defSpk.empty())  log::warn("[Rec] No default speaker found — game audio may not work!");
 
     log::info("[Rec] Tip: set mic-device to \"1\", \"2\" etc. or exact device name. Empty = auto.");
 }
@@ -520,7 +601,18 @@ static void logAudioDevices() {
 // Resolve device name from settings: "" = auto, "1"/"2" = by index, else = exact name
 static std::string resolveDeviceName(const std::string& setting, bool isMicrophone) {
     if (setting.empty()) {
-        return getDefaultAudioDeviceName(isMicrophone);
+        std::string defName = getDefaultAudioDeviceName(isMicrophone);
+        if (!defName.empty()) return defName;
+        // Default device not found (rare) — fall back to first enumerated device
+        enumerateAudioDevices();
+        const auto& devices = isMicrophone ? g_captureDevices : g_renderDevices;
+        if (!devices.empty()) {
+            log::warn("[Rec] Default {} device not found via COM, using first available: \"{}\"",
+                      isMicrophone ? "capture" : "render", devices[0]);
+            return devices[0];
+        }
+        log::error("[Rec] No {} devices found at all!", isMicrophone ? "capture" : "render");
+        return "";
     }
     // Numeric index: "1", "2", etc.
     bool isNumeric = !setting.empty() &&
@@ -561,6 +653,9 @@ public:
 
         m_frameSize = m_w * m_h * 4;
 
+        // Drain any stale GL errors (e.g. from conflicting mods)
+        while (glGetError() != GL_NO_ERROR) {}
+
         if (loadPBOFunctions()) {
             fnGenBuffers(3, m_pbo);
             for (int i = 0; i < 3; i++) {
@@ -587,10 +682,23 @@ public:
 
     // Zero-copy: PBO maps directly into caller's buffer, skipping intermediate copy
     bool captureInto(uint8_t* dst, int dstSize) {
-        if (!m_initialized) return false;
+        if (!m_initialized || !dst || dstSize <= 0) return false;
+        // Guard against zero-size viewport (window minimized / hidden)
+        if (m_w <= 0 || m_h <= 0 || m_frameSize <= 0) return false;
+
+        // Ensure we read from the back buffer (completed frame before swap).
+        // Without this, some drivers default to GL_FRONT which may be
+        // partially rendered or black, causing the "black screen" recordings.
+        glReadBuffer(GL_BACK);
 
         if (!m_usePBO) {
-            glReadPixels(m_vpX, m_vpY, m_w, m_h, GL_BGRA, GL_UNSIGNED_BYTE, dst);
+            if (dstSize < m_frameSize) return false;
+            glReadPixels(m_vpX, m_vpY, m_w, m_h, CAPTURE_FORMAT, GL_UNSIGNED_BYTE, dst);
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR) {
+                log::error("[Rec] glReadPixels error: 0x{:X}", (unsigned)err);
+                return false;
+            }
             return true;
         }
 
@@ -604,16 +712,23 @@ public:
             fnBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[readIdx]);
             void* mapped = fnMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
             if (mapped) {
-                std::memcpy(dst, mapped, dstSize);
+                // Clamp copy size to the smaller of dst and PBO to prevent
+                // out-of-bounds read after viewport resize (ACCESS_VIOLATION fix)
+                int copySize = std::min(dstSize, m_frameSize);
+                std::memcpy(dst, mapped, copySize);
                 gotFrame = true;
                 fnUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            } else {
+                GLenum err = glGetError();
+                if (err != GL_NO_ERROR)
+                    log::error("[Rec] PBO map failed, GL error: 0x{:X}", (unsigned)err);
             }
             fnBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         }
 
         int writeIdx = m_pboFrame % 3;
         fnBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[writeIdx]);
-        glReadPixels(m_vpX, m_vpY, m_w, m_h, GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+        glReadPixels(m_vpX, m_vpY, m_w, m_h, CAPTURE_FORMAT, GL_UNSIGNED_BYTE, nullptr);
         fnBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 
         m_pboFrame++;
@@ -621,7 +736,8 @@ public:
         return gotFrame;
     }
 
-    void reinitIfNeeded() {
+    // Returns true if viewport changed (recording must be stopped!)
+    bool reinitIfNeeded() {
         GLint vp[4];
         glGetIntegerv(GL_VIEWPORT, vp);
         int newW = vp[2], newH = vp[3];
@@ -629,9 +745,19 @@ public:
         if (newH % 2) newH--;
         if (newW != m_w || newH != m_h) {
             log::info("[Rec] Viewport changed {}x{} -> {}x{}, reinit", m_w, m_h, newW, newH);
+            bool wasValid = (m_w > 0 && m_h > 0);
             destroy();
             init();
+            return wasValid;  // true = was capturing, viewport changed → stop recording
         }
+        return false;
+    }
+
+    // Check if viewport is zero (window minimized or hidden)
+    bool isViewportZero() const {
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        return vp[2] <= 0 || vp[3] <= 0;
     }
 
     void destroy() {
@@ -688,7 +814,12 @@ public:
         int idx = -1;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_freeSlots.empty()) { ++m_dropped; return; }
+            if (m_freeSlots.empty()) {
+                int d = ++m_dropped;
+                if (d == 1 || (d % 60 == 0))
+                    log::warn("[Rec] Frame dropped (pool full): total dropped={}", d);
+                return;
+            }
             idx = m_freeSlots.front();
             m_freeSlots.pop();
         }
@@ -717,10 +848,10 @@ public:
     }
 
 protected:
-    static constexpr int DEFAULT_MAX_QUEUE = 120;      // ~2s buffer at 60fps — large enough for NVENC on GT 630M
-    static constexpr int SW_ENCODER_MAX_QUEUE = 360;   // ~6s buffer for libx264 (GT 630M always falls back here)
+    static constexpr int DEFAULT_MAX_QUEUE = 32;       // ~0.5s at 60fps (was 120 — 1GB alloc caused 15s freeze)
+    static constexpr int SW_ENCODER_MAX_QUEUE = 90;    // ~1.5s for libx264 (was 360 — 3GB alloc!)
     static constexpr DWORD PIPE_BUF_SIZE = 64 * 1024 * 1024;    // 64MB pipe (~8 frames at 1080p, prevents write stalls)
-    static constexpr DWORD SW_PIPE_BUF_SIZE = 256 * 1024 * 1024; // 256MB for libx264 — absorbs BELOW_NORMAL scheduling gaps
+    static constexpr DWORD SW_PIPE_BUF_SIZE = 128 * 1024 * 1024; // 128MB for libx264 (was 256MB)
     static constexpr DWORD FFMPEG_WAIT_TIMEOUT = 15000; // 15s wait for FFmpeg finalization
 
     int m_maxQueue{DEFAULT_MAX_QUEUE};
@@ -759,6 +890,21 @@ protected:
     bool m_ffmpegOk{false};
     std::string m_stderrLogPath;
 
+    // Quick check if FFmpeg process is still running
+    bool checkFFmpegAlive() const {
+        if (m_proc == INVALID_HANDLE_VALUE) return false;
+        DWORD exitCode = 0;
+        if (!GetExitCodeProcess(m_proc, &exitCode)) return false;
+        return exitCode == STILL_ACTIVE;
+    }
+
+    // Clean up FFmpeg handles without full stopPipeline (no writer/pool)
+    void cleanupFFmpegHandles() {
+        if (m_pipe != INVALID_HANDLE_VALUE) { CloseHandle(m_pipe); m_pipe = INVALID_HANDLE_VALUE; }
+        if (m_proc != INVALID_HANDLE_VALUE) { CloseHandle(m_proc); m_proc = INVALID_HANDLE_VALUE; }
+        if (m_nulHandle != INVALID_HANDLE_VALUE) { CloseHandle(m_nulHandle); m_nulHandle = INVALID_HANDLE_VALUE; }
+    }
+
     // Timing
     std::chrono::steady_clock::time_point m_startTime;
     std::chrono::steady_clock::time_point m_lastCapture;
@@ -785,9 +931,11 @@ protected:
         // NORMAL priority — do NOT use ABOVE_NORMAL, it starves the game's GL
         // thread and causes FPS drops in the game itself.
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        log::info("[Rec] Writer thread started (tid={})", GetCurrentThreadId());
         std::vector<uint8_t> frameBuf;
         double nextPts = 0.0;
         bool firstFrame = true;
+        int statsCounter = 0;
 
         for (;;) {
             int idx = -1;
@@ -853,7 +1001,22 @@ protected:
             // Write actual captured frame
             writeFrameToPipe(frameBuf.data(), m_frameSize);
             nextPts += m_captureInterval;
+
+            // Periodic stats log (~every 5 seconds at 60fps)
+            if (++statsCounter % 300 == 0) {
+                int queueSize = 0;
+                int freeSize = 0;
+                {
+                    std::lock_guard<std::mutex> lk(m_mtx);
+                    queueSize = static_cast<int>(m_writeQueue.size());
+                    freeSize = static_cast<int>(m_freeSlots.size());
+                }
+                log::info("[Rec] Stats: written={} dropped={} duped={} queue={} free={}",
+                          m_frames.load(), m_dropped.load(), m_duped.load(),
+                          queueSize, freeSize);
+            }
         }
+        log::info("[Rec] Writer thread exiting");
     }
 
     void writeFrameToPipe(const uint8_t* data, int size) {
@@ -1088,21 +1251,34 @@ protected:
                 hwChain.push_back(fb);
         }
 
-        // Cache encoder test results across recordings.
-        // On GT 630M, each testEncoderWorks() call spawns FFmpeg and waits up to 10s,
-        // causing a visible game freeze on every F5 press. Test once, cache forever.
-        static std::unordered_map<std::string, bool> s_encoderCache;
+        // Use global encoder cache (pre-warmed at mod load on background thread).
+        // If cache isn't ready yet (F5 pressed very early), test on demand.
 
         for (const auto& enc : hwChain) {
-            bool works;
-            auto it = s_encoderCache.find(enc);
-            if (it != s_encoderCache.end()) {
-                works = it->second;
+            bool works = false;
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lk(g_encoderCacheMtx);
+                auto it = g_encoderCache.find(enc);
+                if (it != g_encoderCache.end()) {
+                    works = it->second;
+                    cached = true;
+                }
+            }
+            if (cached) {
                 log::info("[Rec] Encoder {} (cached): {}", enc, works ? "OK" : "FAIL");
             } else {
-                log::info("[Rec] Testing encoder: {}", enc);
+                log::warn("[Rec] Encoder {} not in cache — testing on main thread "
+                          "(press F5 later to avoid freeze)", enc);
+                auto t0 = std::chrono::steady_clock::now();
                 works = testEncoderWorks(ffmpegExe, enc, getOutputDir());
-                s_encoderCache[enc] = works;
+                double dt = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                log::info("[Rec] Encoder {} test: {} ({:.1f}s)", enc, works ? "OK" : "FAIL", dt);
+                {
+                    std::lock_guard<std::mutex> lk(g_encoderCacheMtx);
+                    g_encoderCache[enc] = works;
+                }
             }
             if (works) {
                 std::string cmd = buildFFmpegCommand(
@@ -1204,8 +1380,12 @@ public:
 
     bool start(int w, int h) {
         if (m_state != State::Idle) return false;
+        auto startupT0 = std::chrono::steady_clock::now();
+        log::info("[Rec] ── start() begin ({}x{}) ──", w, h);
 
         readSettings();
+        log::info("[Rec] Settings: quality={} fps={} encoder={} mic={} gameAudio={}",
+                  m_quality, m_fps, m_encoderSetting, m_micEnabled, m_gameAudioEnabled);
 
         if (w <= 0 || h <= 0) return false;
         m_w = w; m_h = h;
@@ -1249,19 +1429,32 @@ public:
             if (g_wasapiLoopbackSupported) {
                 // Render device (speakers/headphones) → WASAPI loopback
                 gameAudioDev = resolveDeviceName(m_gameAudioDevice, false);
+                log::info("[Rec] WASAPI loopback device resolved: \"{}\" (from setting: \"{}\")",
+                          gameAudioDev, m_gameAudioDevice);
             } else {
                 // Capture device (Stereo Mix) → dshow fallback
                 if (m_gameAudioDevice.empty()) {
-                    // Auto-detect: search capture devices for Stereo Mix
+                    // Auto-detect: search capture devices for Stereo Mix / Стерео микшер
                     enumerateAudioDevices();
+                    log::info("[Rec] Searching {} capture devices for Stereo Mix...",
+                              g_captureDevices.size());
                     for (const auto& dev : g_captureDevices) {
                         std::string lo = dev;
                         for (auto& c : lo) if (c >= 'A' && c <= 'Z') c += 32;
-                        if (lo.find("mix") != std::string::npos ||
-                            dev.find("\xD0\xBC\xD0\xB8\xD0\xBA\xD1\x88\xD0\xB5\xD1\x80") != std::string::npos) {
+                        // English: "stereo mix", "mix"; Russian: "микшер", "стерео"
+                        if (lo.find("stereo") != std::string::npos ||
+                            lo.find("mix") != std::string::npos ||
+                            dev.find("\xD0\xBC\xD0\xB8\xD0\xBA\xD1\x88\xD0\xB5\xD1\x80") != std::string::npos ||
+                            dev.find("\xD1\x81\xD1\x82\xD0\xB5\xD1\x80\xD0\xB5\xD0\xBE") != std::string::npos) {
                             gameAudioDev = dev;
+                            log::info("[Rec] Found Stereo Mix device: \"{}\"", dev);
                             break;
                         }
+                    }
+                    if (gameAudioDev.empty()) {
+                        log::warn("[Rec] No Stereo Mix found. Capture devices:");
+                        for (const auto& dev : g_captureDevices)
+                            log::warn("[Rec]   - \"{}\"", dev);
                     }
                 } else {
                     gameAudioDev = resolveDeviceName(m_gameAudioDevice, true);
@@ -1269,22 +1462,40 @@ public:
             }
             if (gameAudioDev.empty()) {
                 if (g_wasapiLoopbackSupported)
-                    log::warn("[Rec] Game audio: speaker device not found. "
-                              "Set game-audio-device to '1' or exact speaker name.");
+                    log::warn("[Rec] Game audio: speaker device not found! "
+                              "Set game-audio-device to '1' or exact speaker name. "
+                              "Render devices available:");
                 else
                     log::warn("[Rec] Game audio: Stereo Mix not found. "
                               "Enable it: Sound Settings → Recording tab → right-click → "
                               "Show Disabled Devices → Enable Stereo Mix. "
                               "Or update FFmpeg from gyan.dev for WASAPI loopback.");
+                // Log available devices to help user debug
+                if (g_wasapiLoopbackSupported) {
+                    enumerateAudioDevices();
+                    for (size_t i = 0; i < g_renderDevices.size(); i++)
+                        log::warn("[Rec]   {}: \"{}\"", i + 1, g_renderDevices[i]);
+                    if (g_renderDevices.empty())
+                        log::error("[Rec]   (no render devices found!)");
+                }
+                Notification::create(
+                    "Game audio device not found! Press F9 to select device.",
+                    NotificationIcon::Warning, 5.f
+                )->show();
             } else {
                 log::info("[Rec] Game audio ({}) : \"{}\"",
                     g_wasapiLoopbackSupported ? "WASAPI loopback" : "dshow/StereoMix",
                     gameAudioDev);
             }
+        } else {
+            log::info("[Rec] Game audio: disabled in settings");
         }
 
         std::string encoderName;
         int actualFps = m_fps;
+        log::info("[Rec] Starting FFmpeg (encoder cache ready: {})...",
+                  g_encoderCacheReady.load() ? "yes" : "NO — may freeze!");
+        auto ffmpegT0 = std::chrono::steady_clock::now();
         if (!startFFmpeg(ffmpeg, w, h, m_fps, m_encoderSetting, qualityToCRF(m_quality),
                          m_outPath, false, false,
                          m_micEnabled, micDev,
@@ -1296,8 +1507,61 @@ public:
             )->show();
             return false;
         }
+        double ffmpegDt = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - ffmpegT0).count();
+        log::info("[Rec] FFmpeg spawned in {:.2f}s", ffmpegDt);
 
-        // Update FPS if software encoder reduced it
+        // ── Early exit detection ──
+        // If FFmpeg fails to open an audio device, it exits within ~200ms.
+        // Detect this and gracefully retry without audio instead of a broken recording.
+        bool hasAnyAudio = (m_micEnabled && !micDev.empty()) ||
+                           (m_gameAudioEnabled && !gameAudioDev.empty());
+        if (hasAnyAudio) {
+            Sleep(400);
+            if (!checkFFmpegAlive()) {
+                log::error("[Rec] FFmpeg died immediately after spawn — audio device likely failed!");
+                log::error("[Rec] Check FFmpeg log: {}", m_stderrLogPath);
+                cleanupFFmpegHandles();
+
+                // Retry without audio
+                log::warn("[Rec] Retrying WITHOUT audio streams...");
+                m_ffmpegPriority = NORMAL_PRIORITY_CLASS;
+                m_pipeBufSize = PIPE_BUF_SIZE;
+                m_maxQueue = DEFAULT_MAX_QUEUE;
+                m_poolSize = m_maxQueue + 4;
+
+                if (!startFFmpeg(ffmpeg, w, h, m_fps, m_encoderSetting,
+                                 qualityToCRF(m_quality), m_outPath, false, false,
+                                 false, "", false, "",
+                                 encoderName, actualFps)) {
+                    Notification::create(
+                        "FFmpeg failed even without audio!",
+                        NotificationIcon::Error, 5.f
+                    )->show();
+                    return false;
+                }
+
+                Sleep(300);
+                if (!checkFFmpegAlive()) {
+                    log::error("[Rec] FFmpeg keeps dying — giving up");
+                    cleanupFFmpegHandles();
+                    Notification::create(
+                        "FFmpeg keeps crashing! Check ~ffmpeg_log.txt",
+                        NotificationIcon::Error, 5.f
+                    )->show();
+                    return false;
+                }
+
+                Notification::create(
+                    "Audio device error! Recording video only. Check mod logs.",
+                    NotificationIcon::Warning, 5.f
+                )->show();
+                micDev.clear();
+                gameAudioDev.clear();
+                log::warn("[Rec] Proceeding with video-only recording");
+            }
+        }
+
         if (actualFps != m_fps) {
             log::info("[Rec] FPS adapted: {} -> {} (software encoder)", m_fps, actualFps);
             m_fps = actualFps;
@@ -1305,7 +1569,15 @@ public:
         }
 
         // Allocate pool AFTER encoder selection (software encoder increases queue size)
-        allocatePool();
+        {
+            auto poolT0 = std::chrono::steady_clock::now();
+            allocatePool();
+            double poolDt = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - poolT0).count();
+            int poolMB = (m_poolSize * m_frameSize) / (1024 * 1024);
+            log::info("[Rec] Pool allocated: {} slots × {}KB = {}MB ({:.2f}s)",
+                      m_poolSize, m_frameSize / 1024, poolMB, poolDt);
+        }
 
         m_encoderName = encoderName;
 
@@ -1336,11 +1608,16 @@ public:
 
         log::info("[Rec] Recording started ({}x{} @{}fps, encoder={}{})",
                   w, h, m_fps, encoderName, audioInfo);
+        double totalDt = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - startupT0).count();
+        log::info("[Rec] ── start() completed in {:.2f}s ──", totalDt);
         return true;
     }
 
     void stop() {
         if (m_state != State::Active) return;
+        log::info("[Rec] ── stop() called (frames={}, dropped={}, duped={}) ──",
+                  m_frames.load(), m_dropped.load(), m_duped.load());
 
         // Immediately set Saving — blocks new captures, returns GL thread fast
         m_state = State::Saving;
@@ -1348,8 +1625,11 @@ public:
 
         // All heavy work on a background thread (pipe close, FFmpeg wait, notifications)
         std::thread([this] {
+            auto stopT0 = std::chrono::steady_clock::now();
+
             // 1. Join writer thread (drains remaining frames)
             if (m_writerThread.joinable()) m_writerThread.join();
+            log::info("[Rec] Writer thread joined");
 
             // 2. Close pipe → FFmpeg gets EOF on video input
             if (m_pipe != INVALID_HANDLE_VALUE) {
@@ -1526,6 +1806,7 @@ private:
 // ==================================================================
 
 static RecorderIndicator* g_recIndicator = nullptr;
+static bool g_conflictDetected = false; // another recorder mod hooks swapBuffers
 static bool g_f5Held  = false;
 static bool g_f8Held  = false;
 static bool g_f9Held  = false;
@@ -1617,6 +1898,7 @@ static void onF9Pressed() {
 
 // F12 = Take screenshot (BMP)
 static void takeScreenshot() {
+    if (g_conflictDetected) return;
     if (!g_capture.isInitialized()) {
         Notification::create("Screenshot failed: not initialized", NotificationIcon::Error, 2.f)->show();
         return;
@@ -1671,6 +1953,14 @@ static void takeScreenshot() {
 }
 
 static void onF5Pressed() {
+    if (g_conflictDetected) {
+        Notification::create(
+            "Recording disabled: another recorder mod is active! Remove it.",
+            NotificationIcon::Error, 3.f
+        )->show();
+        return;
+    }
+
     auto& rec = ScreenRecorder::get();
 
     if (rec.isSaving()) {
@@ -1704,6 +1994,13 @@ static void onF5Pressed() {
 
 class $modify(RecorderEGLView, cocos2d::CCEGLView) {
     void swapBuffers() {
+        // If another recorder mod is loaded, skip ALL our GL work to prevent
+        // ACCESS_VIOLATION crashes from dual-hook PBO/readback conflicts
+        if (g_conflictDetected) {
+            cocos2d::CCEGLView::swapBuffers();
+            return;
+        }
+
         auto& rec = ScreenRecorder::get();
 
         detectGPU();
@@ -1715,12 +2012,28 @@ class $modify(RecorderEGLView, cocos2d::CCEGLView) {
         }
 
         // Periodic viewport re-check (every 120 frames)
+        // If viewport changes during recording → auto-stop (FFmpeg has fixed resolution)
         if (g_capture.isInitialized() && (g_frameCounter % 120 == 0)) {
-            g_capture.reinitIfNeeded();
+            bool viewportChanged = g_capture.reinitIfNeeded();
+            if (viewportChanged && rec.isActive()) {
+                log::warn("[Rec] Viewport changed during recording — auto-stopping! "
+                          "Resolution changes (fullscreen/windowed/resize) require re-recording.");
+                detachRecIndicator();
+                rec.stop();
+                Notification::create(
+                    "Recording stopped: window resolution changed! "
+                    "Press F5 to start a new recording.",
+                    NotificationIcon::Warning, 5.f
+                )->show();
+            }
         }
 
+        // Skip capture if window is minimized (viewport = 0x0)
+        bool windowMinimized = g_capture.isInitialized() && g_capture.isViewportZero();
+
         // Capture BEFORE swap: reads from GL_BACK (complete frame, no sync stall)
-        if (rec.isActive() && g_capture.isInitialized()) {
+        // Skip if window minimized — viewport is 0x0, GL readback would be garbage
+        if (rec.isActive() && g_capture.isInitialized() && !windowMinimized) {
             rec.captureDirectly(g_capture);
         }
 
@@ -1784,7 +2097,34 @@ class $modify(RecorderEGLView, cocos2d::CCEGLView) {
 // ==================================================================
 
 $on_mod(Loaded) {
-    log::info("=== GD Screen Recorder v7.0.0 (by JamStickGD) ===");
+    // ── Conflict detection: two recorder mods = ACCESS_VIOLATION crash ──
+    for (auto* mod : Loader::get()->getAllMods()) {
+        if (mod == Mod::get()) continue;
+        std::string id = mod->getID();
+        // Check for any other screen-recorder mod (known: gdrecorder.screenrecorder)
+        if (id.find("screenrecorder") != std::string::npos ||
+            id.find("screen-recorder") != std::string::npos ||
+            id.find("screen_recorder") != std::string::npos) {
+            g_conflictDetected = true;
+            log::error("[Rec] CONFLICT DETECTED: \"{}\" ({}) is also installed!",
+                       mod->getName(), id);
+            log::error("[Rec] Two screen recorders hooking swapBuffers WILL crash.");
+            log::error("[Rec] Recording is DISABLED. Remove one mod to fix.");
+        }
+    }
+
+    if (g_conflictDetected) {
+        Loader::get()->queueInMainThread([] {
+            Notification::create(
+                "CONFLICT: Another screen recorder mod detected! "
+                "Disable one to prevent crashes. Recording disabled.",
+                NotificationIcon::Error, 10.f
+            )->show();
+        });
+        return; // skip all init — don't probe ffmpeg, don't enumerate devices
+    }
+
+    log::info("=== GD Screen Recorder v1.0 (by JamStickGD) ===");
     log::info("F5  = Start/Stop recording");
     log::info("F8  = Cycle microphone device");
     log::info("F9  = Cycle game audio device");
@@ -1807,6 +2147,12 @@ $on_mod(Loaded) {
             log::warn("[Rec] To fix game audio: update FFmpeg → https://www.gyan.dev/ffmpeg/builds/");
             log::warn("[Rec] Or enable Stereo Mix: Sound Settings → Recording → right-click → Show Disabled Devices → Enable");
         }
+
+        // Pre-test all encoders in background — so F5 starts instantly
+        std::string logDir = recDir;
+        std::thread([ffmpegPath, logDir] {
+            prewarmEncoderCache(ffmpegPath, logDir);
+        }).detach();
     } else {
         log::warn("[Rec] ffmpeg.exe not found — place it in the GD folder.");
     }
