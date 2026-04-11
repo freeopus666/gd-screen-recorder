@@ -5,7 +5,7 @@
     },
     "id": "freeopus666.screenrecorder",
     "name": "GD Screen Recorder",
-    "version": "7.0.0",
+    "version": "1.0.0",
     "developer": "FreeOpus666",
     "description": "Record your gameplay directly inside Geometry Dash. Captures video with GPU-accelerated encoding (NVIDIA/AMD/Intel) and falls back to CPU automatically. Supports two independent audio tracks — microphone (Track 1) and game audio via WASAPI loopback (Track 2), so you can mute each separately in any video editor. Uses async PBO readback for zero-stall frame capture. Requires ffmpeg.exe placed in the Geometry Dash folder — download at gyan.dev/ffmpeg/builds. Hotkeys: F5 start/stop · F8 cycle mic · F9 cycle audio device · F11 toggle indicator · F12 screenshot.",
     "links": {
@@ -64,7 +64,7 @@
             "name": "Record Game Audio (Track 2)",
             "description": "Record game audio as Track 2 via WASAPI loopback. Press F9 in-game to select output device.",
             "type": "bool",
-            "default": false
+            "default": true
         },
         "game-audio-device": {
             "name": "Game Audio Device",
