@@ -81,6 +81,26 @@ namespace fs = std::filesystem;
 // Native pixel format for glReadPixels: BGRA matches the BMP/FFmpeg rawvideo pipeline
 #define CAPTURE_FORMAT GL_BGRA
 
+// GL sync object constants (OpenGL 3.2 / ARB_sync)
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE  0x9117
+#endif
+#ifndef GL_SYNC_FLUSH_COMMANDS_BIT
+#define GL_SYNC_FLUSH_COMMANDS_BIT     0x00000001
+#endif
+#ifndef GL_ALREADY_SIGNALED
+#define GL_ALREADY_SIGNALED            0x911A
+#endif
+#ifndef GL_CONDITION_SATISFIED
+#define GL_CONDITION_SATISFIED         0x911C
+#endif
+#ifndef GL_TIMEOUT_EXPIRED
+#define GL_TIMEOUT_EXPIRED             0x911B
+#endif
+#ifndef GL_WAIT_FAILED
+#define GL_WAIT_FAILED                 0x911D
+#endif
+
 typedef ptrdiff_t GLsizeiptr_t;
 
 typedef void      (APIENTRY* PFN_glGenBuffers)(GLsizei, GLuint*);
@@ -97,6 +117,16 @@ static PFN_glBufferData    fnBufferData    = nullptr;
 static PFN_glMapBuffer     fnMapBuffer     = nullptr;
 static PFN_glUnmapBuffer   fnUnmapBuffer   = nullptr;
 
+// GL 3.2 sync objects — used for non-blocking PBO readback (prevents GL thread stalls).
+// Use void* instead of GLsync to avoid dependency on glext.h / GLEW headers.
+typedef void* (APIENTRY* PFN_glFenceSync)(GLenum condition, GLbitfield flags);
+typedef GLenum (APIENTRY* PFN_glClientWaitSync)(void* sync, GLbitfield flags, GLuint64 timeout);
+typedef void   (APIENTRY* PFN_glDeleteSync)(void* sync);
+
+static PFN_glFenceSync       fnFenceSync       = nullptr;
+static PFN_glClientWaitSync  fnClientWaitSync  = nullptr;
+static PFN_glDeleteSync      fnDeleteSync      = nullptr;
+
 static bool loadPBOFunctions() {
     static int cached = -1;
     if (cached >= 0) return cached == 1;
@@ -107,6 +137,11 @@ static bool loadPBOFunctions() {
     fnBufferData    = (PFN_glBufferData)   wglGetProcAddress("glBufferData");
     fnMapBuffer     = (PFN_glMapBuffer)    wglGetProcAddress("glMapBuffer");
     fnUnmapBuffer   = (PFN_glUnmapBuffer)  wglGetProcAddress("glUnmapBuffer");
+
+    // Sync objects are optional: if unavailable, PBO map is used without fence check
+    fnFenceSync      = (PFN_glFenceSync)      wglGetProcAddress("glFenceSync");
+    fnClientWaitSync = (PFN_glClientWaitSync) wglGetProcAddress("glClientWaitSync");
+    fnDeleteSync     = (PFN_glDeleteSync)     wglGetProcAddress("glDeleteSync");
 
     bool ok = fnGenBuffers && fnDeleteBuffers && fnBindBuffer &&
               fnBufferData && fnMapBuffer && fnUnmapBuffer;
@@ -666,18 +701,20 @@ public:
         while (glGetError() != GL_NO_ERROR) {}
 
         if (loadPBOFunctions()) {
-            fnGenBuffers(3, m_pbo);
-            for (int i = 0; i < 3; i++) {
+            fnGenBuffers(4, m_pbo);
+            for (int i = 0; i < 4; i++) {
                 fnBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[i]);
                 fnBufferData(GL_PIXEL_PACK_BUFFER, m_frameSize, nullptr, GL_STREAM_READ);
             }
             fnBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             if (glGetError() == GL_NO_ERROR) {
                 m_usePBO = true;
-                log::info("[Rec] SharedCapture: PBO OK 3x ({}x{})", m_w, m_h);
+                bool hasSyncFns = (fnFenceSync && fnClientWaitSync && fnDeleteSync);
+                log::info("[Rec] SharedCapture: PBO OK 4x ({}x{}) sync={}",
+                          m_w, m_h, hasSyncFns ? "fence" : "none");
             } else {
-                fnDeleteBuffers(3, m_pbo);
-                m_pbo[0] = m_pbo[1] = m_pbo[2] = 0;
+                fnDeleteBuffers(4, m_pbo);
+                m_pbo[0] = m_pbo[1] = m_pbo[2] = m_pbo[3] = 0;
             }
         }
 
@@ -712,33 +749,61 @@ public:
         }
 
         bool gotFrame = false;
-        // Triple-buffered PBO: read the buffer written 2 frames ago.
-        // This gives the GPU DMA transfer 2 full frame intervals (~33ms at 60fps)
-        // to complete before we map it, eliminating glMapBuffer stalls on complex scenes
-        // that caused progressive FPS degradation as the level loaded more objects.
-        if (m_pboFrame >= 2) {
-            int readIdx = (m_pboFrame - 2) % 3;
-            fnBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[readIdx]);
-            void* mapped = fnMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
-            if (mapped) {
-                // Clamp copy size to the smaller of dst and PBO to prevent
-                // out-of-bounds read after viewport resize (ACCESS_VIOLATION fix)
-                int copySize = std::min(dstSize, m_frameSize);
-                std::memcpy(dst, mapped, copySize);
-                gotFrame = true;
-                fnUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-            } else {
-                GLenum err = glGetError();
-                if (err != GL_NO_ERROR)
-                    log::error("[Rec] PBO map failed, GL error: 0x{:X}", (unsigned)err);
+        // Quad-buffered PBO with 3-frame readback delay.
+        // 3 frames at 60 fps = ~50 ms for the GPU DMA to finish — eliminates stalls
+        // on complex scenes / integrated GPUs where the old 2-frame delay was too short.
+        // Non-blocking fence-sync check: if DMA is still in flight, we drop this
+        // frame instead of blocking the GL thread (which caused the lag).
+        if (m_pboFrame >= 3) {
+            int readIdx = (m_pboFrame - 3) % 4;
+
+            // Non-blocking readiness check via fence sync
+            bool ready = true;
+            if (fnClientWaitSync && m_pboSync[readIdx]) {
+                GLenum syncRes = fnClientWaitSync(
+                    m_pboSync[readIdx], GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+                ready = (syncRes == GL_ALREADY_SIGNALED ||
+                         syncRes == GL_CONDITION_SATISFIED);
+                if (!ready) {
+                    // DMA not finished — skip map, game frame keeps running
+                    ++m_syncMisses;
+                    if (m_syncMisses == 1 || m_syncMisses % 300 == 0)
+                        log::warn("[Rec] PBO DMA not ready (miss #{}), dropping frame",
+                                  m_syncMisses);
+                }
             }
-            fnBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+            if (ready) {
+                fnBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[readIdx]);
+                void* mapped = fnMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+                if (mapped) {
+                    // Clamp copy size to the smaller of dst and PBO to prevent
+                    // out-of-bounds read after viewport resize (ACCESS_VIOLATION fix)
+                    int copySize = std::min(dstSize, m_frameSize);
+                    std::memcpy(dst, mapped, copySize);
+                    gotFrame = true;
+                    fnUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                } else {
+                    GLenum err = glGetError();
+                    if (err != GL_NO_ERROR)
+                        log::error("[Rec] PBO map failed, GL error: 0x{:X}", (unsigned)err);
+                }
+                fnBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            }
         }
 
-        int writeIdx = m_pboFrame % 3;
+        int writeIdx = m_pboFrame % 4;
+        // Delete the old sync for this slot before issuing new readback
+        if (fnDeleteSync && m_pboSync[writeIdx]) {
+            fnDeleteSync(m_pboSync[writeIdx]);
+            m_pboSync[writeIdx] = nullptr;
+        }
         fnBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbo[writeIdx]);
         glReadPixels(m_vpX, m_vpY, m_w, m_h, CAPTURE_FORMAT, GL_UNSIGNED_BYTE, nullptr);
         fnBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        // Insert fence after the async DMA kick-off
+        if (fnFenceSync)
+            m_pboSync[writeIdx] = fnFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
         m_pboFrame++;
 
@@ -771,20 +836,29 @@ public:
 
     void destroy() {
         if (m_usePBO && fnDeleteBuffers) {
-            fnDeleteBuffers(3, m_pbo);
-            m_pbo[0] = m_pbo[1] = m_pbo[2] = 0;
+            // Delete fence syncs before PBOs
+            if (fnDeleteSync) {
+                for (int i = 0; i < 4; i++) {
+                    if (m_pboSync[i]) { fnDeleteSync(m_pboSync[i]); m_pboSync[i] = nullptr; }
+                }
+            }
+            fnDeleteBuffers(4, m_pbo);
+            m_pbo[0] = m_pbo[1] = m_pbo[2] = m_pbo[3] = 0;
         }
         m_usePBO = false;
         m_fallbackBuf.clear();
         m_initialized = false;
         m_pboFrame = 0;
+        m_syncMisses = 0;
     }
 
 private:
     bool   m_initialized{false};
     bool   m_usePBO{false};
-    GLuint m_pbo[3]{};
+    GLuint m_pbo[4]{};
+    void*  m_pboSync[4]{};   // GL fence sync handles (void* = GLsync without glext.h)
     int    m_pboFrame{0};
+    int    m_syncMisses{0};
     int    m_vpX{}, m_vpY{}, m_w{}, m_h{}, m_frameSize{};
     std::vector<uint8_t> m_fallbackBuf;
 };
@@ -857,8 +931,8 @@ public:
     }
 
 protected:
-    static constexpr int DEFAULT_MAX_QUEUE = 32;       // ~0.5s at 60fps (was 120 — 1GB alloc caused 15s freeze)
-    static constexpr int SW_ENCODER_MAX_QUEUE = 90;    // ~1.5s for libx264 (was 360 — 3GB alloc!)
+    static constexpr int DEFAULT_MAX_QUEUE = 60;       // 1s at 60fps — more resilient against FFmpeg hiccups
+    static constexpr int SW_ENCODER_MAX_QUEUE = 120;   // 2s for libx264
     static constexpr DWORD PIPE_BUF_SIZE = 64 * 1024 * 1024;    // 64MB pipe (~8 frames at 1080p, prevents write stalls)
     static constexpr DWORD SW_PIPE_BUF_SIZE = 128 * 1024 * 1024; // 128MB for libx264 (was 256MB)
     static constexpr DWORD FFMPEG_WAIT_TIMEOUT = 15000; // 15s wait for FFmpeg finalization
@@ -960,29 +1034,28 @@ protected:
                 captureTime = m_frameTimes[idx];
             }
 
-            // Copy frame data to local buffer and IMMEDIATELY release the pool
-            // slot back to the GL thread. Previously the slot was held for the
-            // entire duration of WriteFile calls (including all dup writes),
-            // which could block for seconds under pipe backpressure, starving
-            // the capture pool and causing cascading FPS drops.
-            if ((int)frameBuf.size() != m_frameSize)
-                frameBuf.resize(m_frameSize);
-            std::memcpy(frameBuf.data(), m_pool[idx].data(), m_frameSize);
+            // Flip-during-copy: combine the vertical flip (OpenGL bottom-up → video top-down)
+            // with the pool→frameBuf copy in a single pass. Eliminates the separate
+            // swap_ranges flip (saves ~4 MB/frame of memory bandwidth at 1080p).
+            {
+                const int stride = m_width * 4;
+                if ((int)frameBuf.size() != m_frameSize)
+                    frameBuf.resize(m_frameSize);
+                if (m_width > 0 && m_height > 0) {
+                    for (int y = 0; y < m_height; y++) {
+                        std::memcpy(
+                            frameBuf.data() + y * stride,
+                            m_pool[idx].data() + (m_height - 1 - y) * stride,
+                            stride
+                        );
+                    }
+                } else {
+                    std::memcpy(frameBuf.data(), m_pool[idx].data(), m_frameSize);
+                }
+            }
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 m_freeSlots.push(idx);
-            }
-
-            // Flip rows in-place (OpenGL reads bottom-up; video encoders expect top-down).
-            // Doing this here eliminates the -vf vflip CPU filter inside FFmpeg,
-            // cutting ~15% encode overhead on old/weak GPUs like GT 630M.
-            if (m_width > 0 && m_height > 1) {
-                const int stride = m_width * 4;
-                for (int y = 0; y < m_height / 2; y++) {
-                    uint8_t* r1 = frameBuf.data() + y * stride;
-                    uint8_t* r2 = frameBuf.data() + (m_height - 1 - y) * stride;
-                    std::swap_ranges(r1, r1 + stride, r2);
-                }
             }
 
             if (firstFrame) {
@@ -1136,7 +1209,7 @@ protected:
         if (micInputIdx >= 0)  cmd << " -map " << micInputIdx << ":a";
         if (gameInputIdx >= 0) cmd << " -map " << gameInputIdx << ":a";
 
-        // Vertical flip is handled in the writer thread (std::swap_ranges per row),
+        // Vertical flip is handled in the writer thread (flip-during-copy),
         // so no -vf vflip is needed here — saves a CPU filter pass in FFmpeg.
         // For libx264 on slow/old GPUs (GT 630M): auto-scale to 720p when source
         // is larger. 720p libx264 ultrafast encodes ~60fps on any dual-core CPU;
