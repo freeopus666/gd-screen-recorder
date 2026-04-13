@@ -7,7 +7,7 @@
     "name": "GD Screen Recorder",
     "version": "1.0.0",
     "developer": "FreeOpus666",
-    "description": "Record your gameplay directly inside Geometry Dash. Captures video with GPU-accelerated encoding (NVIDIA/AMD/Intel) and falls back to CPU automatically. Supports two independent audio tracks — microphone (Track 1) and game audio via WASAPI loopback (Track 2), so you can mute each separately in any video editor. Uses async PBO readback for zero-stall frame capture. Requires ffmpeg.exe placed in the Geometry Dash folder — download at gyan.dev/ffmpeg/builds. Hotkeys: F5 start/stop · F8 cycle mic · F9 cycle audio device · F11 toggle indicator · F12 screenshot.",
+    "description": "Turn Geometry Dash into a <cr>cinematic</c> recording studio: <co>GD Screen Recorder</c> captures your gameplay directly in-game, exports one <cg>showcase-ready MP4</c> with <cb>three polished audio tracks</c> (Game + Mic, Game Audio, Mic Only), and powers every clip with <cy>smooth GPU-optimized capture</c>, <cp>smart encoder fallback</c>, and <cl>creator-ready hotkeys</c> for completions, showcases, highlights, and true YouTube-ready moments.",
     "links": {
         "source": "https://github.com/FreeOpus666/gd-screen-recorder"
     },
@@ -30,10 +30,18 @@
         },
         "encoder": {
             "name": "Video Encoder",
-            "description": "1 = Auto. 2 = NVIDIA. 3 = AMD. 4 = Intel. 5 = CPU",
+            "description": "1=Auto 2=NVIDIA(120fps) 3=AMD(120fps) 4=Intel(120fps) 5=x264(dynamic fps cap) 6=mpeg4(dynamic fps cap) 7=x265(30fps). CPU encoders are capped automatically by workload.",
             "type": "int",
             "default": 1,
             "min": 1,
+            "max": 7
+        },
+        "gpu-downscale": {
+            "name": "GPU Downscale",
+            "description": "0=Off 1=Auto 2=720p 3=540p 4=480p 5=360p. Uses GPU blit before readback when available; otherwise falls back to FFmpeg scale.",
+            "type": "int",
+            "default": 1,
+            "min": 0,
             "max": 5
         },
         "output-dir": {
@@ -49,8 +57,8 @@
             "default": true
         },
         "mic-enabled": {
-            "name": "Record Microphone (Track 1)",
-            "description": "Record microphone as audio Track 1. Press F8 in-game to select mic device from a popup list.",
+            "name": "Record Microphone",
+            "description": "Record microphone as a separate audio track via WASAPI endpoint capture. Press F8 in-game to select mic device from a popup list.",
             "type": "bool",
             "default": false
         },
@@ -60,17 +68,37 @@
             "type": "string",
             "default": ""
         },
+        "mic-volume": {
+            "name": "Microphone Volume",
+            "description": "Microphone volume in percent. 100 = normal, 200 = 2x louder, 50 = half. Applied during mux after recording.",
+            "type": "int",
+            "default": 100,
+            "min": 0,
+            "max": 300
+        },
         "game-audio-enabled": {
-            "name": "Record Game Audio (Track 2)",
-            "description": "Record game audio as Track 2 via WASAPI loopback. Press F9 in-game to select output device.",
+            "name": "Record Game Audio",
+            "description": "Record game audio from Geometry Dash's FMOD mix. Uses process loopback only as a fallback if FMOD tap is unavailable.",
             "type": "bool",
             "default": true
         },
-        "game-audio-device": {
-            "name": "Game Audio Device",
-            "description": "Output device number or name. Press F9 in-game to pick from active devices. Empty = default output.",
-            "type": "string",
-            "default": ""
+        "show-unsupported-os-warning": {
+            "name": "Warn If Game Audio Unsupported",
+            "description": "Show a warning before recording if neither the FMOD game-audio tap nor the fallback process loopback backend is available.",
+            "type": "bool",
+            "default": true
+        },
+        "auto-disable-mic-on-error": {
+            "name": "Auto Disable Mic On Error",
+            "description": "If the microphone input fails to start, continue recording without the microphone track instead of aborting the session.",
+            "type": "bool",
+            "default": true
+        },
+        "log-performance-degradation": {
+            "name": "Log Performance Issues",
+            "description": "Write performance warnings such as encoder backpressure, dropped frames, and PBO misses to the mod log.",
+            "type": "bool",
+            "default": true
         }
     },
     "tags": [
