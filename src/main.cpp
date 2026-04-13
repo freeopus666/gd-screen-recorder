@@ -1,6 +1,6 @@
 /*
- * GD Screen Recorder v1.0.0 - Release Edition
- * Developer: FreeOpus666
+ * GD Screen Recorder v1.0 - Stable Edition
+ * Developer: JamStickGD
  *
  * Features:
  *  - F5  = Start/Stop recording
@@ -8,7 +8,7 @@
  *  - F12 = Screenshot (BMP)
  *  - F11 = Toggle indicator
  *  - Track 1 (default): Game + Mic mix, Track 2: Game Audio only, Track 3: Microphone only
- *  - Microphone captured separately via WASAPI and muxed as its own audio track
+ *  - Microphone recorded as Track 2 (via WASAPI endpoint capture)
  *  - Both tracks in ONE .mp4 file - mute/unmute per track in any video player
  *  - PBO quad-buffer async GPU readback with fence sync (zero GL stall)
  *  - Hardware encoder auto-detection (NVENC/AMF/QSV) with libx264 fallback
@@ -55,7 +55,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
@@ -298,24 +297,6 @@ static fs::path utf8Path(const std::string& utf8) {
     return fs::path(utf8ToUtf16(utf8));
 }
 
-static int64_t steadyNowNanos() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()
-    ).count();
-}
-
-static int64_t steadyTimePointToNanos(std::chrono::steady_clock::time_point tp) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        tp.time_since_epoch()
-    ).count();
-}
-
-static double computeLeadSeconds(int64_t videoStartNs, int64_t audioStartNs) {
-    if (videoStartNs <= 0 || audioStartNs <= 0 || videoStartNs <= audioStartNs) return 0.0;
-    double secs = static_cast<double>(videoStartNs - audioStartNs) / 1000000000.0;
-    return std::clamp(secs, 0.0, 10.0);
-}
-
 static std::string gdDir() {
     wchar_t buf[MAX_PATH]{};
     DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -542,30 +523,6 @@ static std::string pickEncoder(int setting) {
         case 7: return "libx265";
         default: return autoDetectEncoder();
     }
-}
-
-static bool isSoftwareEncoderName(const std::string& encoder) {
-    return encoder == "libx264" || encoder == "libx265";
-}
-
-static bool isCpuRealtimeEncoderName(const std::string& encoder) {
-    return encoder == "mpeg4" || isSoftwareEncoderName(encoder);
-}
-
-static std::string chooseSoftwareFallbackEncoder(const std::string& primary,
-                                                 int requestedFps,
-                                                 int width,
-                                                 int height) {
-    if (primary == "libx264" || primary == "mpeg4" || primary == "libx265") {
-        return primary;
-    }
-
-    long long pixels = static_cast<long long>(std::max(width, 0)) *
-                       static_cast<long long>(std::max(height, 0));
-    if (g_gpuIsWeak || requestedFps >= 60 || pixels > 1280LL * 720LL) {
-        return "mpeg4";
-    }
-    return "libx264";
 }
 
 // ==================================================================
@@ -1164,7 +1121,7 @@ static bool looksLikeStereoMixDevice(const std::string& name) {
 // ==================================================================
 // Game Audio Capture via WASAPI process loopback (GeometryDash.exe only)
 // Captures audio rendered by the current process tree, writes to a temp WAV,
-// then FFmpeg muxes it into the final MP4 as a separate audio track.
+// then FFmpeg muxes it into the final MP4 as Track 1.
 // ==================================================================
 
 #if GDSR_HAS_PROCESS_LOOPBACK
@@ -1427,7 +1384,6 @@ public:
     bool start(const std::string& wavPath) {
         if (m_running) return true;
         m_wavPath = wavPath;
-        m_firstPacketNs.store(0, std::memory_order_release);
         m_running = true;
         m_thread = std::thread([this] { captureLoop(); });
         return true;
@@ -1440,23 +1396,14 @@ public:
     }
 
     bool isRunning() const { return m_running; }
-    int64_t firstPacketNs() const { return m_firstPacketNs.load(std::memory_order_acquire); }
     std::string wavPath() const { return m_wavPath; }
 
 private:
     std::atomic<bool> m_running{false};
-    std::atomic<int64_t> m_firstPacketNs{0};
     std::string m_wavPath;
     std::thread m_thread;
     std::mutex m_eventMtx;
     HANDLE m_sampleReadyEvent{nullptr};
-
-    void markFirstPacketTimestamp() {
-        int64_t expected = 0;
-        m_firstPacketNs.compare_exchange_strong(
-            expected, steadyNowNanos(), std::memory_order_release, std::memory_order_relaxed
-        );
-    }
 
     void signalWakeEvent() {
         std::lock_guard<std::mutex> lk(m_eventMtx);
@@ -1643,7 +1590,6 @@ private:
 
                 UINT32 bytesToWrite = numFrames * captureFormat.nBlockAlign;
                 if (bytesToWrite > 0) {
-                    markFirstPacketTimestamp();
                     if ((bufferFlags & AUDCLNT_BUFFERFLAGS_SILENT) || !pData) {
                         if (zeroBuffer.size() < bytesToWrite) zeroBuffer.resize(bytesToWrite, 0);
                         std::fill(zeroBuffer.begin(), zeroBuffer.begin() + bytesToWrite, 0);
@@ -1708,7 +1654,6 @@ public:
         m_dataSize = 0;
         m_droppedBlocks = 0;
         m_pendingBytes = 0;
-        m_firstPacketNs.store(0, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             while (!m_chunks.empty()) m_chunks.pop();
@@ -1806,19 +1751,11 @@ public:
     }
 
     bool isRunning() const { return m_running; }
-    int64_t firstPacketNs() const { return m_firstPacketNs.load(std::memory_order_acquire); }
 
 private:
     static constexpr size_t MAX_PENDING_BYTES = 8 * 1024 * 1024;
     static constexpr size_t CHUNK_POOL_LIMIT = 24;
     static constexpr size_t INITIAL_CHUNK_BYTES = 4096 * 2 * sizeof(float);
-
-    void markFirstPacketTimestamp() {
-        int64_t expected = 0;
-        m_firstPacketNs.compare_exchange_strong(
-            expected, steadyNowNanos(), std::memory_order_release, std::memory_order_relaxed
-        );
-    }
 
     static FMOD_RESULT F_CALL dspRead(FMOD_DSP_STATE* dspState, float* inbuffer, float* outbuffer,
                                       unsigned int length, int inchannels, int* outchannels) {
@@ -1843,7 +1780,6 @@ private:
 
     void pushSamples(const float* input, unsigned int frames, int inchannels) {
         if (!m_running || !input || frames == 0 || inchannels <= 0) return;
-        markFirstPacketTimestamp();
 
         std::vector<char> chunk;
         {
@@ -1950,7 +1886,6 @@ private:
     std::vector<std::vector<char>> m_freeChunks;
     size_t m_pendingBytes{0};
     uint32_t m_dataSize{0};
-    std::atomic<int64_t> m_firstPacketNs{0};
     int m_sampleRate{48000};
     FMOD::System* m_system{nullptr};
     FMOD::ChannelGroup* m_masterGroup{nullptr};
@@ -1968,7 +1903,6 @@ public:
         if (m_running) return true;
         m_wavPath = wavPath;
         m_deviceName = deviceName;
-        m_firstPacketNs.store(0, std::memory_order_release);
         m_running = true;
         m_thread = std::thread([this] { captureLoop(); });
         Sleep(80);
@@ -1982,23 +1916,14 @@ public:
     }
 
     bool isRunning() const { return m_running; }
-    int64_t firstPacketNs() const { return m_firstPacketNs.load(std::memory_order_acquire); }
 
 private:
     std::atomic<bool> m_running{false};
-    std::atomic<int64_t> m_firstPacketNs{0};
     std::string m_wavPath;
     std::string m_deviceName;
     std::thread m_thread;
     std::mutex m_eventMtx;
     HANDLE m_sampleReadyEvent{nullptr};
-
-    void markFirstPacketTimestamp() {
-        int64_t expected = 0;
-        m_firstPacketNs.compare_exchange_strong(
-            expected, steadyNowNanos(), std::memory_order_release, std::memory_order_relaxed
-        );
-    }
 
     void signalWakeEvent() {
         std::lock_guard<std::mutex> lk(m_eventMtx);
@@ -2141,7 +2066,6 @@ private:
 
                 UINT32 bytesToWrite = numFrames * mixFormat->nBlockAlign;
                 if (bytesToWrite > 0) {
-                    markFirstPacketTimestamp();
                     if ((bufferFlags & AUDCLNT_BUFFERFLAGS_SILENT) || !pData) {
                         if (zeroBuffer.size() < bytesToWrite) zeroBuffer.resize(bytesToWrite, 0);
                         std::fill(zeroBuffer.begin(), zeroBuffer.begin() + bytesToWrite, 0);
@@ -2382,31 +2306,18 @@ private:
         m_captureW = desiredW;
         m_captureH = desiredH;
 
-        bool wantsResize = (m_captureW != m_srcW || m_captureH != m_srcH);
-        bool wantsGpuFlipOnly = !wantsResize &&
-                                (static_cast<long long>(m_captureW) * m_captureH >=
-                                 640LL * 360LL);
-        bool wantsGpuBlit = wantsResize || wantsGpuFlipOnly;
+        bool wantsGpuBlit = (m_captureW != m_srcW || m_captureH != m_srcH);
         if (wantsGpuBlit && loadFramebufferFunctions()) {
             if (createScaleFBO(m_captureW, m_captureH)) {
                 m_useScaleFBO = true;
-                if (wantsResize) {
-                    log::info("[Rec] SharedCapture: GPU downscale {}x{} -> {}x{}",
-                              m_srcW, m_srcH, m_captureW, m_captureH);
-                } else {
-                    log::info("[Rec] SharedCapture: GPU flip/blit enabled at {}x{}",
-                              m_captureW, m_captureH);
-                }
+                log::info("[Rec] SharedCapture: GPU downscale {}x{} -> {}x{}",
+                          m_srcW, m_srcH, m_captureW, m_captureH);
             } else {
-                if (wantsResize) {
-                    log::warn("[Rec] SharedCapture: GPU downscale unavailable, falling back to full-size readback");
-                    m_captureW = m_srcW;
-                    m_captureH = m_srcH;
-                } else {
-                    log::warn("[Rec] SharedCapture: GPU flip/blit unavailable, falling back to CPU flip");
-                }
+                log::warn("[Rec] SharedCapture: GPU downscale unavailable, falling back to full-size readback");
+                m_captureW = m_srcW;
+                m_captureH = m_srcH;
             }
-        } else if (wantsResize) {
+        } else if (wantsGpuBlit) {
             log::warn("[Rec] SharedCapture: FBO/blit unavailable, using FFmpeg-side scale fallback");
             m_captureW = m_srcW;
             m_captureH = m_srcH;
@@ -2620,7 +2531,7 @@ private:
         glReadBuffer(GL_BACK);
     }
 
-    static constexpr int PBO_COUNT = 8;
+    static constexpr int PBO_COUNT = 6;
     bool   m_initialized{false};
     bool   m_usePBO{false};
     bool   m_usePersistentPBO{false};
@@ -2662,7 +2573,6 @@ public:
         if (m_frameSize != cap.frameSize()) return;
 
         auto now = std::chrono::steady_clock::now();
-        int64_t captureNowNs = steadyTimePointToNanos(now);
         auto tolerance = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(m_captureInterval * 0.05)
         );
@@ -2720,7 +2630,6 @@ public:
                 m_freeSlots.push(idx);
                 return;
             }
-            markFirstVideoFrameTimestamp(captureNowNs);
             ++m_frames;
             m_writerCv.notify_one();
         } else {
@@ -2872,16 +2781,6 @@ protected:
     std::chrono::steady_clock::time_point m_startTime;
     std::chrono::steady_clock::time_point m_lastCapture;
     std::chrono::steady_clock::time_point m_nextCaptureDue;
-    std::atomic<int64_t> m_firstVideoFrameNs{0};
-    std::atomic<int64_t> m_stopRequestNs{0};
-
-    void markFirstVideoFrameTimestamp(int64_t frameNs) {
-        if (frameNs <= 0) return;
-        int64_t expected = 0;
-        m_firstVideoFrameNs.compare_exchange_strong(
-            expected, frameNs, std::memory_order_release, std::memory_order_relaxed
-        );
-    }
 
     void allocatePool() {
         size_t totalBytes = static_cast<size_t>(m_poolSize) * static_cast<size_t>(m_frameSize);
@@ -2910,43 +2809,9 @@ protected:
         log::info("[Rec] Writer thread started (tid={})", GetCurrentThreadId());
         std::vector<uint8_t> frameBuf;
         frameBuf.resize(m_frameSize);
-        std::vector<uint8_t> lastFrameBuf;
-        lastFrameBuf.resize(m_frameSize);
-        bool haveTimelineBase = false;
-        bool haveLastFrame = false;
-        double firstCaptureTime = 0.0;
-        int64_t firstFrameNsAbs = 0;
-        int64_t nextFrameIndex = 0;
+        double nextPts = 0.0;
+        bool firstFrame = true;
         int statsCounter = 0;
-
-        auto writeDuplicateFrame = [&]() {
-            if (!haveLastFrame || m_frameSize <= 0) return;
-            writeFrameToPipe(lastFrameBuf.data(), m_frameSize);
-            ++m_duped;
-            ++nextFrameIndex;
-        };
-
-        auto writeActualFrame = [&](const uint8_t* src) {
-            if (!src || m_frameSize <= 0) return;
-            writeFrameToPipe(src, m_frameSize);
-            std::memcpy(lastFrameBuf.data(), src, m_frameSize);
-            haveLastFrame = true;
-            ++nextFrameIndex;
-        };
-
-        auto fillGapWithDuplicates = [&](int64_t targetFrameIndex) {
-            if (!haveLastFrame || targetFrameIndex <= nextFrameIndex) return;
-
-            int64_t missingFrames = targetFrameIndex - nextFrameIndex;
-            if (m_logPerformanceDegradation && missingFrames >= std::max<int64_t>(2, m_fps / 4)) {
-                log::warn("[Rec] Timing gap detected: duplicating {} frame(s) to preserve A/V sync",
-                          missingFrames);
-            }
-
-            while (nextFrameIndex < targetFrameIndex) {
-                writeDuplicateFrame();
-            }
-        };
 
         for (;;) {
             int idx = -1;
@@ -2958,20 +2823,7 @@ protected:
                     return !m_writeQueue.empty() || m_state != State::Active;
                 });
             }
-            if (m_writeQueue.empty()) {
-                if (m_state != State::Active) {
-                    int64_t stopRequestNs = m_stopRequestNs.load(std::memory_order_acquire);
-                    if (haveLastFrame && haveTimelineBase && stopRequestNs > firstFrameNsAbs && m_captureInterval > 0.0) {
-                        double stopRelativeTime = static_cast<double>(stopRequestNs - firstFrameNsAbs) / 1000000000.0;
-                        int64_t targetTotalFrames = std::max<int64_t>(
-                            1,
-                            static_cast<int64_t>(std::llround(stopRelativeTime / m_captureInterval))
-                        );
-                        fillGapWithDuplicates(targetTotalFrames);
-                    }
-                }
-                break;
-            }
+            if (m_writeQueue.empty()) break;
             if (!m_writeQueue.pop(idx)) continue;
             captureTime = m_frameTimes[idx];
 
@@ -2994,27 +2846,43 @@ protected:
                 frameData = frameBuf.data();
             }
 
-            if (!haveTimelineBase) {
-                haveTimelineBase = true;
-                firstCaptureTime = captureTime;
-                firstFrameNsAbs = steadyTimePointToNanos(m_startTime) +
-                    static_cast<int64_t>(std::llround(captureTime * 1000000000.0));
+            if (firstFrame) {
+                firstFrame = false;
+                nextPts = captureTime;
             }
 
-            double relativeTime = captureTime - firstCaptureTime;
-            if (relativeTime < 0.0) relativeTime = 0.0;
+            // Fill timing gaps with duplicate frames (prevents video speed-up
+            // when game FPS drops below recording FPS). Cap at 0.5 seconds -
+            // larger gaps are skipped to avoid pipe flooding from a long game
+            // pause, which was causing cascading backpressure that killed FPS.
+            int dupCount = 0;
+            int queueBacklog = static_cast<int>(m_writeQueue.size());
 
-            int64_t targetFrameIndex = 0;
-            if (m_captureInterval > 0.0) {
-                targetFrameIndex = static_cast<int64_t>(std::llround(relativeTime / m_captureInterval));
+            int maxDups = std::max(2, m_fps / 2); // preserve wall-clock duration up to ~0.5s gaps
+            if (m_isSoftwareEncoder) {
+                maxDups = std::min(maxDups, 12);
+            } else if (m_isMpeg4Encoder) {
+                maxDups = std::min(maxDups, 18);
             }
-            if (targetFrameIndex < nextFrameIndex) {
-                targetFrameIndex = nextFrameIndex;
+            if (queueBacklog >= (m_maxQueue * 3) / 4) {
+                maxDups = std::min(maxDups, 8);
+            } else if (queueBacklog >= m_maxQueue / 2) {
+                maxDups = std::min(maxDups, 12);
             }
-            fillGapWithDuplicates(targetFrameIndex);
+            while (nextPts + m_captureInterval * 0.5 < captureTime && dupCount < maxDups) {
+                if (frameData) writeFrameToPipe(frameData, m_frameSize);
+                nextPts += m_captureInterval;
+                ++m_duped;
+                ++dupCount;
+            }
+            // If gap is still too large after max dups, skip ahead in time
+            if (nextPts + m_captureInterval * 0.5 < captureTime) {
+                nextPts = captureTime;
+            }
 
             // Write actual captured frame
-            if (frameData) writeActualFrame(frameData);
+            if (frameData) writeFrameToPipe(frameData, m_frameSize);
+            nextPts += m_captureInterval;
 
             m_freeSlots.push(idx);
 
@@ -3106,24 +2974,13 @@ protected:
         m_backpressureSkips.store(0);
     }
 
-    static int encoderMaxFps(const std::string& encoder, int width, int height) {
+    static int encoderMaxFps(const std::string& encoder) {
         if (encoder == "h264_nvenc") return 120;
         if (encoder == "h264_amf")   return 120;
         if (encoder == "h264_qsv")   return 120;
-        if (encoder == "mpeg4") {
-            if (height > 1080 || width > 1920) return 30;
-            if (height > 720 || width > 1280)  return 45;
-            return 60;
-        }
-        if (encoder == "libx264") {
-            if (height > 720 || width > 1280) return 30;
-            if (height > 480 || width > 854)  return 45;
-            return 60;
-        }
-        if (encoder == "libx265") {
-            if (height > 720 || width > 1280) return 24;
-            return 30;
-        }
+        if (encoder == "mpeg4")      return 60;
+        if (encoder == "libx264")    return 60;
+        if (encoder == "libx265")    return 30;
         return 120;
     }
 
@@ -3162,46 +3019,6 @@ protected:
             }
         }
         m_poolSize = m_maxQueue + 4;
-    }
-
-    void tunePipelineForFrameSize(const std::string& encoder, int frameBytes, int fps) {
-        if (frameBytes <= 0) return;
-
-        bool softwareEncoder = isSoftwareEncoderName(encoder);
-        bool cpuRealtime = isCpuRealtimeEncoderName(encoder);
-
-        int targetQueue = m_maxQueue;
-        if (softwareEncoder) {
-            targetQueue = std::max(targetQueue, g_gpuIsWeak ? 8 : 12);
-            if (fps >= 60) {
-                targetQueue = std::max(targetQueue, g_gpuIsWeak ? 10 : 14);
-            }
-        } else if (encoder == "mpeg4") {
-            targetQueue = std::max(targetQueue, g_gpuIsWeak ? 10 : 14);
-        } else {
-            targetQueue = std::max(targetQueue, g_gpuIsWeak ? 6 : 10);
-        }
-
-        uint64_t minPipeBytes = cpuRealtime
-            ? static_cast<uint64_t>(g_gpuIsWeak ? 12 : 16) * 1024ULL * 1024ULL
-            : 8ULL * 1024ULL * 1024ULL;
-        int pipeFrames = softwareEncoder ? 3 : (encoder == "mpeg4" ? 4 : 2);
-        uint64_t desiredPipeBytes = static_cast<uint64_t>(frameBytes) *
-                                    static_cast<uint64_t>(pipeFrames);
-        desiredPipeBytes = std::max(desiredPipeBytes, minPipeBytes);
-        desiredPipeBytes = std::min<uint64_t>(desiredPipeBytes, 64ULL * 1024ULL * 1024ULL);
-
-        if (desiredPipeBytes > static_cast<uint64_t>(m_pipeBufSize)) {
-            m_pipeBufSize = static_cast<DWORD>(desiredPipeBytes);
-        }
-        if (targetQueue > m_maxQueue) {
-            m_maxQueue = targetQueue;
-        }
-        m_poolSize = m_maxQueue + 4;
-
-        log::info("[Rec] Pipeline tuned for {}: frame={}KB queue={} pipe={}MB",
-                  encoder, frameBytes / 1024, m_maxQueue,
-                  m_pipeBufSize / (1024 * 1024));
     }
 
     // Build FFmpeg command for video-only encode.
@@ -3368,23 +3185,21 @@ protected:
             }
             if (works) {
                 configurePipelineForEncoder(enc);
-
-                int desiredW = w;
-                int desiredH = h;
-                computeRequestedOutputSize(w, h, enc, gpuDownscaleMode, desiredW, desiredH);
-
-                int maxFps = encoderMaxFps(enc, desiredW, desiredH);
+                int maxFps = encoderMaxFps(enc);
                 int useFps = std::min(fps, maxFps);
                 if (useFps != fps) {
-                    log::warn("[Rec] FPS capped for {}: {} -> {} (workload {}x{}, max={})",
-                              enc, fps, useFps, desiredW, desiredH, maxFps);
+                    log::warn("[Rec] FPS capped for {}: {} -> {} (max={})", enc, fps, useFps, maxFps);
                     Notification::create(
                         "FPS capped to " + std::to_string(useFps) + " for " + enc +
-                        " (" + std::to_string(desiredW) + "x" + std::to_string(desiredH) + ")",
+                        " (max " + std::to_string(maxFps) + ")",
                         NotificationIcon::Info, 3.f
                     )->show();
                 }
                 actualFps = useFps;
+
+                int desiredW = w;
+                int desiredH = h;
+                computeRequestedOutputSize(w, h, enc, gpuDownscaleMode, desiredW, desiredH);
 
                 int inputW = w;
                 int inputH = h;
@@ -3406,8 +3221,6 @@ protected:
                     g_capture.resetCaptureSize();
                 }
 
-                tunePipelineForFrameSize(enc, inputW * inputH * 4, useFps);
-
                 std::string cmd = buildFFmpegCommand(
                     ffmpegExe, inputW, inputH, useFps, enc, crf, outPath, addKeyframes, lowLatency,
                     desiredW, desiredH
@@ -3428,27 +3241,29 @@ protected:
         }
 
         // All HW encoders failed - fall back to CPU encoding
-        std::string swEncoder = chooseSoftwareFallbackEncoder(primary, fps, w, h);
+        std::string swEncoder = primary;
+        if (swEncoder != "libx264" && swEncoder != "mpeg4" && swEncoder != "libx265") {
+            swEncoder = "libx264";
+        }
         log::warn("[Rec] All HW encoders failed, falling back to {}. "
                   "CPU encoding will be used - may impact game performance.", swEncoder);
         configurePipelineForEncoder(swEncoder);
 
-        int desiredW = w;
-        int desiredH = h;
-        computeRequestedOutputSize(w, h, swEncoder, gpuDownscaleMode, desiredW, desiredH);
-
-        int maxFps = encoderMaxFps(swEncoder, desiredW, desiredH);
+        int maxFps = encoderMaxFps(swEncoder);
         int useFps = std::min(fps, maxFps);
         if (useFps != fps) {
-            log::warn("[Rec] FPS capped for {}: {} -> {} (workload {}x{}, max={})",
-                      swEncoder, fps, useFps, desiredW, desiredH, maxFps);
+            log::warn("[Rec] FPS capped for {}: {} -> {} (max={})", swEncoder, fps, useFps, maxFps);
             Notification::create(
                 "FPS capped to " + std::to_string(useFps) + " for " + swEncoder +
-                " (" + std::to_string(desiredW) + "x" + std::to_string(desiredH) + ")",
+                " (max " + std::to_string(maxFps) + ")",
                 NotificationIcon::Info, 3.f
             )->show();
         }
         actualFps = useFps;
+
+        int desiredW = w;
+        int desiredH = h;
+        computeRequestedOutputSize(w, h, swEncoder, gpuDownscaleMode, desiredW, desiredH);
 
         int inputW = w;
         int inputH = h;
@@ -3467,8 +3282,6 @@ protected:
         } else {
             g_capture.resetCaptureSize();
         }
-
-        tunePipelineForFrameSize(swEncoder, inputW * inputH * 4, actualFps);
 
         std::string cmd = buildFFmpegCommand(
             ffmpegExe, inputW, inputH, actualFps, swEncoder, crf, outPath, addKeyframes, lowLatency,
@@ -3538,7 +3351,7 @@ static bool remuxWithFaststart(const std::string& filePath) {
 }
 
 // ==================================================================
-// ScreenRecorder (F5 - normal recording with multi-track audio)
+// ScreenRecorder (F5 - Normal Recording with dual audio tracks)
 // ==================================================================
 
 class ScreenRecorder : public RecordingPipeline {
@@ -3617,7 +3430,7 @@ public:
                           PROCESS_LOOPBACK_MIN_BUILD, getWindowsBuildNumber());
                 if (m_showUnsupportedOsWarning) {
                     Notification::create(
-                        "Game audio backend unavailable on this system right now. Recording without game audio.",
+                        "Game audio backend unavailable on this system right now. Recording without Track 1.",
                         NotificationIcon::Warning, 5.f
                     )->show();
                 }
@@ -3758,13 +3571,6 @@ public:
             }
             log::warn("[Rec] Using SOFTWARE encoder (libx264) - update GPU drivers for h264_nvenc!");
             Notification::create(warnMsg, NotificationIcon::Warning, 7.f)->show();
-        } else if (encoderName == "mpeg4") {
-            std::string warnMsg = "GPU encoder failed. Using fast CPU fallback (mpeg4) for smoother recording; files will be larger.";
-            if (recordMic) {
-                warnMsg += " Disable mic in settings if the game still lags.";
-            }
-            log::warn("[Rec] Using fast CPU fallback (mpeg4) because hardware encoders were unavailable");
-            Notification::create(warnMsg, NotificationIcon::Warning, 7.f)->show();
         }
 
         m_state       = State::Active;
@@ -3777,10 +3583,6 @@ public:
         m_startTime   = std::chrono::steady_clock::now();
         m_lastCapture = m_startTime;
         m_nextCaptureDue = m_startTime;
-        m_firstVideoFrameNs.store(0, std::memory_order_release);
-        m_stopRequestNs.store(0, std::memory_order_release);
-        m_gameAudioLeadSecs = 0.0;
-        m_micAudioLeadSecs = 0.0;
 
         m_writerThread = std::thread([this] { writerLoop(); });
 
@@ -3804,7 +3606,6 @@ public:
         if (m_state != State::Active) return;
         log::info("[Rec] ?? stop() called (frames={}, dropped={}, duped={}) ??",
                   m_frames.load(), m_dropped.load(), m_duped.load());
-        m_stopRequestNs.store(steadyNowNanos(), std::memory_order_release);
 
         if (m_micSessionEnabled) {
             MicrophoneCapture::get().stop();
@@ -3882,34 +3683,9 @@ public:
             bool gameOn = m_gameAudioSessionEnabled;
             std::string micWavPath = m_micWavPath;
             std::string wavPath = m_gameAudioWavPath;
-            int64_t firstVideoFrameNs = m_firstVideoFrameNs.load(std::memory_order_acquire);
-            if (firstVideoFrameNs <= 0) firstVideoFrameNs = steadyTimePointToNanos(m_startTime);
-
-            double gameAudioLeadSecs = 0.0;
-            if (gameOn) {
-                int64_t gameFirstPacketNs = m_gameAudioUsesFmod
-                    ? FmodGameAudioCapture::get().firstPacketNs()
-                    : GameAudioCapture::get().firstPacketNs();
-                gameAudioLeadSecs = computeLeadSeconds(firstVideoFrameNs, gameFirstPacketNs);
-            }
-
-            double micAudioLeadSecs = 0.0;
-            if (micOn) {
-                micAudioLeadSecs = computeLeadSeconds(
-                    firstVideoFrameNs,
-                    MicrophoneCapture::get().firstPacketNs()
-                );
-            }
-
-            m_gameAudioLeadSecs = gameAudioLeadSecs;
-            m_micAudioLeadSecs = micAudioLeadSecs;
+            bool directGameAudio = m_usingDirectGameAudio;
             bool haveGameWav = !wavPath.empty() && wavHasAudioData(wavPath);
             bool haveMicWav = !micWavPath.empty() && wavHasAudioData(micWavPath);
-
-            if (haveGameWav || haveMicWav) {
-                log::info("[Rec] Audio trim offsets: game={:.3f}s mic={:.3f}s",
-                          gameAudioLeadSecs, micAudioLeadSecs);
-            }
 
             // 4a. Mux optional WASAPI tracks into the final MP4.
             if (haveGameWav || haveMicWav) {
@@ -3929,21 +3705,10 @@ public:
                                << " -i \"" << outPath << "\"";
 
                         if (haveGameWav) {
-                            // -ss trims the audio lead (time captured before video frame 0)
-                            if (gameAudioLeadSecs > 0.001) {
-                                char ssBuf[32];
-                                snprintf(ssBuf, sizeof(ssBuf), "%.3f", gameAudioLeadSecs);
-                                muxCmd << " -ss " << ssBuf;
-                            }
                             muxCmd << " -i \"" << wavPath << "\"";
                             gameInputIdx = nextInputIdx++;
                         }
                         if (haveMicWav) {
-                            if (micAudioLeadSecs > 0.001) {
-                                char ssBuf[32];
-                                snprintf(ssBuf, sizeof(ssBuf), "%.3f", micAudioLeadSecs);
-                                muxCmd << " -ss " << ssBuf;
-                            }
                             muxCmd << " -i \"" << micWavPath << "\"";
                             micInputIdx = nextInputIdx++;
                         }
@@ -4142,8 +3907,6 @@ private:
     std::string m_gameAudioWavPath;
     bool m_usingDirectGameAudio{false};
     bool m_gameAudioUsesFmod{false};
-    double m_gameAudioLeadSecs{0.0};
-    double m_micAudioLeadSecs{0.0};
 
     void readSettings() {
         m_quality         = static_cast<int>(Mod::get()->getSettingValue<int64_t>("quality"));
@@ -4162,9 +3925,6 @@ private:
         m_micWavPath.clear();
         m_gameAudioWavPath.clear();
         m_gameAudioUsesFmod = false;
-        m_gameAudioLeadSecs = 0.0;
-        m_micAudioLeadSecs = 0.0;
-        m_stopRequestNs.store(0, std::memory_order_release);
     }
 };
 
@@ -4532,7 +4292,7 @@ static int _gdsr_on_mod_loaded_init = []() {
                 return;
             }
 
-            log::info("=== GD Screen Recorder v1.0.0 Release (by FreeOpus666) ===");
+            log::info("=== GD Screen Recorder v1.0 (by JamStickGD) ===");
             log::info("F5  = Start/Stop recording");
             log::info("F8  = Cycle microphone device");
             log::info("F11 = Toggle indicator");
